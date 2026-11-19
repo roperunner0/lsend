@@ -1,0 +1,34 @@
+name: Build CardputerZero app (.deb)
+
+on:
+  push:
+    paths: ["app/**", "lsend.py", ".github/workflows/build-app.yml"]
+  workflow_dispatch:
+
+jobs:
+  deb:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install aarch64 cross toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y crossbuild-essential-arm64 ninja-build dpkg-dev
+
+      - name: Install CMake 3.31+
+        uses: lukka/get-cmake@latest
+
+      - name: Build and package (downloads the CardputerZero BSP sysroot)
+        run: cmake --workflow --preset cp0-cross-package
+
+      - name: Show package contents
+        run: dpkg-deb -c dist/*.deb
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LocalSend-CardputerZero-deb
+          path: app/dist/*.deb

@@ -1,0 +1,37 @@
+{
+  "app_name": "LocalSend",
+  "package_name": "lsend_app",
+  "version": "0.1.0",
+  "description": "Send and receive files with the official LocalSend apps",
+  "store": {
+    "summary": "AirDrop-style file sharing with the LocalSend apps on your phone and PC",
+    "description": "Send files, folders and text between your CardputerZero and any device running LocalSend (Android, iOS, Windows, macOS, Linux) over your local Wi-Fi. No cloud, no account. Incoming transfers pop up for approval, or turn on Quick Save to accept automatically. Uses the open LocalSend v2.1 protocol with HTTPS.",
+    "categories": [
+      "System Tools",
+      "Radio & Comms"
+    ],
+    "screenshots": [
+      "screenshot/home.png",
+      "screenshot/files.png",
+      "screenshot/incoming.png",
+      "screenshot/home-dark.png"
+    ],
+    "icon": "assets/images/lsend_256.png",
+    "license": "MIT",
+    "source_repo": "https://github.com/roperunner0/lsend",
+    "author": {
+      "github": "roperunner0",
+      "display_name": "Rabid Gummy"
+    },
+    "share_code": "LSND",
+    "permissions": {
+      "camera": false,
+      "microphone": false,
+      "imu": false,
+      "network": true,
+      "additional_hardware": false,
+      "background_service": true,
+      "external_display": false
+    }
+  }
+}
