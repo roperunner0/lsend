@@ -1,0 +1,13 @@
+[Unit]
+Description=LocalSend receiver (lsend)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=__USER__
+ExecStart=/usr/local/bin/lsend receive --yes
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
