@@ -165,6 +165,8 @@ class Core:
         self.session = None        # incoming transfer session
         self.running = True
         self.prompt_timeout = 60
+        self.listener_count = None  # daemon mode: callable -> number of GUI clients
+        self._req_seq = 0
 
     # ---- events
     def emit(self, kind, payload=None):
@@ -210,7 +212,13 @@ class Core:
     def ask(self, req):
         """Block the HTTP thread until the user accepts/rejects (or timeout)."""
         if self.auto_accept:
+            self.log(f"Auto-accepted {len(req['files'])} file(s) from {req['alias']}")
             return True
+        if self.listener_count is not None and self.listener_count() == 0:
+            self.log(f"Rejected {req['alias']} (app closed; quick save off)")
+            return False
+        self._req_seq += 1
+        req["id"] = self._req_seq
         req["evt"] = threading.Event()
         req["decision"] = False
         req["deadline"] = time.time() + self.prompt_timeout
@@ -363,21 +371,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     os.remove(dest)
                 except OSError:
                     pass
-                core.emit("progress_end", f"Receive failed: {name}")
+                core.emit("progress_end", (False, f"Receive failed: {name}"))
                 self.close_connection = True
                 return self._send(500, {"message": "write failed"})
             f["done"] = True
             core.emit("progress", ("Recv " + os.path.basename(name), got, total))
             if all(x["done"] for x in s["files"].values()):
                 core.session = None
-                core.emit("progress_end", f"Saved {len(s['files'])} file(s) to {core.download_dir}")
+                core.emit("progress_end", (True, f"Saved {len(s['files'])} file(s) to {core.download_dir}"))
             return self._send(200)
 
         if p == API + "/cancel":
             s = core.session
             if s and q.get("sessionId") == s["id"]:
                 core.session = None
-                core.emit("progress_end", f"{s['alias']} cancelled")
+                core.emit("progress_end", (False, f"{s['alias']} cancelled"))
             return self._send(200)
 
         self._reject(404, "not found")
@@ -802,7 +810,7 @@ class UI:
 
         def work():
             ok, msg = send(self.core, dev, paths=paths, text=text, pin=self.core.send_pin)
-            self.core.emit("progress_end", ("OK: " if ok else "X ") + msg)
+            self.core.emit("progress_end", (ok, msg))
             self.busy = False
 
         threading.Thread(target=work, daemon=True).start()
@@ -832,7 +840,7 @@ class UI:
                 self.prog = p
             elif kind == "progress_end":
                 self.prog = None
-                self.status = p
+                self.status = p[1] if p[0] else "X " + p[1]
 
     def key(self, k):
         if self.incoming:
@@ -975,7 +983,7 @@ def cli_progress(core, stop):
             line = f"{label} {done * 100 // total}% {human(done)}/{human(total)}" if total else label
             print("\r" + line.ljust(60), end="", flush=True)
         elif kind == "progress_end":
-            print("\r" + str(p).ljust(60), flush=True)
+            print("\r" + p[1].ljust(60), flush=True)
         elif kind in ("log",):
             print(p, flush=True)
 
@@ -1001,7 +1009,9 @@ def cmd_receive(args):
                 label, done, total = p
                 if total:
                     print("\r" + f"{label} {done * 100 // total}%".ljust(60), end="", flush=True)
-            elif kind in ("progress_end", "log"):
+            elif kind == "progress_end":
+                print("\r" + p[1].ljust(60), flush=True)
+            elif kind == "log":
                 print("\r" + str(p).ljust(60), flush=True)
 
     threading.Thread(target=reprint, daemon=True).start()
@@ -1042,6 +1052,189 @@ def cmd_scan(args):
         print("No devices found")
 
 
+# --------------------------------------------------------------------------- daemon / GUI control
+#
+# `lsend daemon` runs in the background and exposes a Unix socket that the
+# CardputerZero GUI app talks to. Protocol: one JSON object per line.
+#
+#   GUI -> daemon: {"cmd":"state"} {"cmd":"scan"} {"cmd":"answer","id":N,"accept":true}
+#                  {"cmd":"send","to":"<fingerprint>","paths":["/abs/file"]}
+#                  {"cmd":"send","to":"<fingerprint>","text":"hello"}
+#                  {"cmd":"set","auto_accept":true} {"cmd":"shutdown"}
+#   daemon -> GUI: {"type":"state",...} {"type":"devices","devices":[...]}
+#                  {"type":"incoming","id":N,"alias":..,"files":[{"name","size"}],"timeout":S}
+#                  {"type":"incoming_done","id":N} {"type":"text","alias":..,"text":..}
+#                  {"type":"progress","label":..,"done":N,"total":N}
+#                  {"type":"progress_end","ok":bool,"msg":..} {"type":"log","msg":..}
+
+def default_socket():
+    return os.path.join(CONF_DIR, "ctl.sock")
+
+
+def public_dev(d):
+    return {k: d.get(k) for k in ("alias", "ip", "port", "protocol", "fingerprint",
+                                  "deviceModel", "deviceType")}
+
+
+class Control:
+    def __init__(self, core, path):
+        self.core = core
+        self.path = path
+        self.clients = []
+        self.lock = threading.Lock()
+        self.pending = {}
+        self.sending = False
+
+    def state(self):
+        c = self.core
+        return {"type": "state", "alias": c.ident.alias, "ip": local_ip(),
+                "port": c.ident.port, "protocol": c.ident.protocol,
+                "download_dir": c.download_dir, "auto_accept": c.auto_accept,
+                "busy": self.sending,
+                "devices": [public_dev(d) for d in c.device_list()]}
+
+    def start(self):
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        if os.path.exists(self.path):
+            probe_s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                probe_s.connect(self.path)
+                probe_s.close()
+                print("lsend daemon already running")
+                sys.exit(0)
+            except OSError:
+                os.unlink(self.path)  # stale socket
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        old = os.umask(0o077)
+        srv.bind(self.path)
+        os.umask(old)
+        srv.listen(4)
+        self.core.listener_count = lambda: len(self.clients)
+        threading.Thread(target=self._accept, args=(srv,), daemon=True).start()
+        threading.Thread(target=self._dispatch, daemon=True).start()
+
+    def _send(self, conn, obj):
+        conn.sendall((json.dumps(obj) + "\n").encode())
+
+    def broadcast(self, obj):
+        with self.lock:
+            for conn in list(self.clients):
+                try:
+                    self._send(conn, obj)
+                except OSError:
+                    self.clients.remove(conn)
+
+    def _accept(self, srv):
+        while True:
+            conn, _ = srv.accept()
+            with self.lock:
+                self.clients.append(conn)
+            threading.Thread(target=self._client, args=(conn,), daemon=True).start()
+
+    def _client(self, conn):
+        try:
+            with self.lock:
+                self._send(conn, self.state())
+            buf = b""
+            while True:
+                data = conn.recv(4096)
+                if not data:
+                    break
+                buf += data
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    try:
+                        msg = json.loads(line)
+                    except ValueError:
+                        continue
+                    self._handle(conn, msg)
+        except OSError:
+            pass
+        finally:
+            with self.lock:
+                if conn in self.clients:
+                    self.clients.remove(conn)
+            conn.close()
+
+    def _handle(self, conn, msg):
+        cmd = msg.get("cmd")
+        core = self.core
+        if cmd == "state":
+            with self.lock:
+                self._send(conn, self.state())
+        elif cmd == "scan":
+            discover(core)
+            self.broadcast({"type": "log", "msg": "Scanning..."})
+        elif cmd == "answer":
+            req = self.pending.pop(msg.get("id"), None)
+            if req:
+                req["decision"] = bool(msg.get("accept"))
+                req["evt"].set()
+        elif cmd == "set":
+            if "auto_accept" in msg:
+                core.auto_accept = bool(msg["auto_accept"])
+            self.broadcast(self.state())
+        elif cmd == "send":
+            dev = next((d for d in core.device_list() if d["fingerprint"] == msg.get("to")), None)
+            if not dev:
+                self.broadcast({"type": "progress_end", "ok": False, "msg": "Device gone, rescan"})
+            elif self.sending:
+                self.broadcast({"type": "progress_end", "ok": False, "msg": "Already sending"})
+            else:
+                self.sending = True
+
+                def work():
+                    try:
+                        ok, m = send(core, dev, paths=msg.get("paths"), text=msg.get("text"),
+                                     pin=msg.get("pin"))
+                    except Exception as e:
+                        ok, m = False, str(e)
+                    self.sending = False
+                    core.emit("progress_end", (ok, m))
+
+                threading.Thread(target=work, daemon=True).start()
+        elif cmd == "shutdown":
+            os._exit(0)
+
+    def _dispatch(self):
+        core = self.core
+        while True:
+            kind, p = core.events.get()
+            if kind == "log":
+                self.broadcast({"type": "log", "msg": p})
+            elif kind == "devices":
+                self.broadcast({"type": "devices",
+                                "devices": [public_dev(d) for d in core.device_list()]})
+            elif kind == "incoming":
+                self.pending[p["id"]] = p
+                self.broadcast({"type": "incoming", "id": p["id"], "alias": p["alias"],
+                                "files": [{"name": f.get("fileName") or "?",
+                                           "size": int(f.get("size") or 0)} for f in p["files"]],
+                                "timeout": int(p["deadline"] - time.time())})
+            elif kind == "incoming_done":
+                self.pending.pop(p.get("id"), None)
+                self.broadcast({"type": "incoming_done", "id": p.get("id")})
+            elif kind == "text":
+                self.broadcast({"type": "text", "alias": p[0], "text": p[1]})
+            elif kind == "progress":
+                self.broadcast({"type": "progress", "label": p[0], "done": p[1], "total": p[2]})
+            elif kind == "progress_end":
+                self.broadcast({"type": "progress_end", "ok": bool(p[0]), "msg": p[1]})
+
+
+def cmd_daemon(args):
+    path = args.socket or default_socket()
+    core = make_core(args, auto_accept=args.yes)
+    ctl = Control(core, path)
+    ctl.start()
+    print(f"lsend daemon: {core.ident.alias} {local_ip()}:{core.ident.port} "
+          f"({core.ident.protocol}) control={path}", flush=True)
+    discover(core)
+    while True:
+        time.sleep(120)
+        announce(core)  # stay visible
+
+
 def cmd_tui(args):
     core = make_core(args)
     discover(core)
@@ -1065,8 +1258,12 @@ def main():
     s.add_argument("--to", required=True, help="alias (substring), IP or IP:port")
     s.add_argument("--text")
     sub.add_parser("scan", help="list devices")
+    d = sub.add_parser("daemon", help="background service for the GUI app")
+    d.add_argument("-y", "--yes", action="store_true", help="quick save: auto-accept")
+    d.add_argument("--socket", help=f"control socket (default {default_socket()})")
     args = ap.parse_args()
-    {"receive": cmd_receive, "send": cmd_send, "scan": cmd_scan}.get(args.cmd, cmd_tui)(args)
+    {"receive": cmd_receive, "send": cmd_send, "scan": cmd_scan,
+     "daemon": cmd_daemon}.get(args.cmd, cmd_tui)(args)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,7 @@
 # lsend — LocalSend for the CardputerZero
 
+> **Want the graphical launcher app?** See [`app/`](app/README.md). GitHub Actions builds an installable `.deb` for it.
+
 LocalSend protocol v2.1 client in a single Python file (standard library only).
 Works with the official LocalSend apps on Android, iOS, Windows, macOS and Linux.
 
@@ -19,6 +21,7 @@ In that case, turn off **Encryption** in the phone app's settings.
 | `lsend send a.jpg dir/ --to Pixel` | Send files/folders (alias substring, IP, or IP:port) |
 | `lsend send --text "hi" --to Pixel` | Send a text message |
 | `lsend scan` | List devices |
+| `lsend daemon` | Background service used by the GUI app (`-y` = quick save) |
 
 Global flags: `--alias NAME`, `--pin 1234` (require PIN to receive), `--send-pin 1234`, `--dir PATH`, `--http`, `--port`.
 
